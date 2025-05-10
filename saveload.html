@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Image Categorizer</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+    <div class="container">
+        <h1>Image Categorizer</h1>
+        <div class="category-section">
+            <h2>1. Create Categories / Manage Session</h2>
+            <input type="text" id="categoryNameInput" placeholder="Enter category name">
+            <button id="addCategoryButton">Add Category</button>
+            <button id="saveCategoriesButton">Save Categories to File</button>
+            <button id="loadCategoriesButton">Load Categories from File</button>
+            <input type="file" id="categoryFileInput" accept=".json" style="display: none;">
+            <hr style="margin: 10px 0;">
+            <button id="loadProgressButton">Load Progress from File</button>
+            <input type="file" id="progressFileInput" accept=".json" style="display: none;">
+            <h3>Existing Categories:</h3>
+            <ul id="categoryList"></ul>
+        </div>
+
+        <div class="controls">
+            <h2>2. Select Images</h2>
+            <p>Select individual image files. For selecting a whole folder's content, your browser might show a folder icon if it supports `webkitdirectory`.</p>
+            <p><strong>Important for Loading Progress:</strong> If you've loaded a progress file, please re-select the exact same image files or folder you were working with.</p>
+            <input type="file" id="imageFilesInput" multiple accept="image/*">
+            <input type="file" id="imageFolderInput" webkitdirectory directory multiple accept="image/*" style="display:none;">
+            <label for="useFolderInputCheckbox">Use folder picker (experimental):</label>
+            <input type="checkbox" id="useFolderInputCheckbox">
+        </div>
+
+        <div class="image-section" style="display: none;">
+            <h2>3. Categorize Images</h2>
+            <p id="progress">Image x of y</p>
+            <img id="imagePreview" src="#" alt="Image preview">
+            <div id="categoryButtons">
+                <!-- Category buttons will be added here -->
+            </div>
+            <button id="skipButton">0. Skip Image</button>
+            <button id="undoButton" style="margin-top: 5px;" disabled>Undo Last Action (Backspace)</button> <!-- ADDED THIS BUTTON -->
+            <button id="saveProgressButton" style="margin-top: 10px;">Save Current Progress</button>
+        </div>
+
+        <div class="actions-section" style="display: none;">
+            <h2>4. Download Categorized Images</h2>
+            <p>All images have been processed. You can now download them as ZIP files per category.</p>
+            <div id="downloadSection">
+                <!-- Download links/buttons will appear here -->
+            </div>
+            <button id="resetButton">Start Over</button>
+        </div>
+        <p id="status"></p>
+    </div>
+
+    <script>
+        const imageFilesInput = document.getElementById('imageFilesInput');
+        const imageFolderInput = document.getElementById('imageFolderInput');
+        const useFolderInputCheckbox = document.getElementById('useFolderInputCheckbox');
+        
+        const categoryNameInput = document.getElementById('categoryNameInput');
+        const addCategoryButton = document.getElementById('addCategoryButton');
+        const categoryList = document.getElementById('categoryList');
+        const saveCategoriesButton = document.getElementById('saveCategoriesButton');
+        const loadCategoriesButton = document.getElementById('loadCategoriesButton');
+        const categoryFileInput = document.getElementById('categoryFileInput');
+        
+        const imageSection = document.querySelector('.image-section');
+        const imagePreview = document.getElementById('imagePreview');
+        const progressText = document.getElementById('progress');
+        const categoryButtonsContainer = document.getElementById('categoryButtons');
+        const skipButton = document.getElementById('skipButton');
+        const undoButton = document.getElementById('undoButton'); // New
+        
+        const actionsSection = document.querySelector('.actions-section');
+        const downloadSection = document.getElementById('downloadSection');
+        const resetButton = document.getElementById('resetButton');
+        const statusText = document.getElementById('status');
+
+        // Progress saving/loading elements
+        const saveProgressButton = document.getElementById('saveProgressButton');
+        const loadProgressButton = document.getElementById('loadProgressButton');
+        const progressFileInput = document.getElementById('progressFileInput');
+
+        let files = [];
+        let currentFileIndex = 0;
+        let categories = {}; // { "categoryName": [fileObjects], ... }
+        let skippedFiles = [];
+        let lastAction = null; // New: To store details of the last action for undo
+
+        let isRestoringProgress = false;
+        let pendingProgressData = null;
+
+        function addCategorizationKeyListener() {
+            document.addEventListener('keydown', handleCategorizationKeyPress);
+        }
+
+        function removeCategorizationKeyListener() {
+            document.removeEventListener('keydown', handleCategorizationKeyPress);
+        }
+
+        useFolderInputCheckbox.addEventListener('change', function() {
+            if (this.checked) {
+                imageFilesInput.style.display = 'none';
+                imageFolderInput.style.display = 'inline-block';
+            } else {
+                imageFilesInput.style.display = 'inline-block';
+                imageFolderInput.style.display = 'none';
+            }
+        });
+
+        imageFilesInput.addEventListener('change', handleFileSelection);
+        imageFolderInput.addEventListener('change', handleFileSelection);
+
+        if (saveCategoriesButton) {
+            saveCategoriesButton.addEventListener('click', saveCategories);
+        }
+        if (loadCategoriesButton) {
+            loadCategoriesButton.addEventListener('click', () => categoryFileInput.click());
+        }
+        if (categoryFileInput) {
+            categoryFileInput.addEventListener('change', handleCategoryFileLoad);
+        }
+
+        // Progress Listeners
+        if (saveProgressButton) {
+            saveProgressButton.addEventListener('click', () => {
+                if (files.length === 0 && Object.keys(categories).length === 0) {
+                    statusText.textContent = "Nothing to save yet.";
+                    return;
+                }
+                const progressData = {
+                    version: "1.0.0",
+                    allFileMetadata: filesArrayToMetadata(files.map(f => f.file)), // Assuming files array holds {file: File, originalIndex: number} or just File
+                    categoryAssignments: categoriesToMetadata(categories),
+                    skippedFileMetadata: filesArrayToMetadata(skippedFiles.map(f => f.file)), // if skippedFiles also stores wrapper objects
+                    currentFileIndex: currentFileIndex,
+                    categoryDefinitions: Object.keys(categories)
+                };
+
+                // If 'files' and 'skippedFiles' directly store File objects (which they do in this version):
+                const directProgressData = {
+                    version: "1.0.0",
+                    allFileMetadata: filesArrayToMetadata(files),
+                    categoryAssignments: categoriesToMetadata(categories), // categoriesToMetadata already handles File objects
+                    skippedFileMetadata: filesArrayToMetadata(skippedFiles),
+                    currentFileIndex: currentFileIndex,
+                    categoryDefinitions: Object.keys(categories)
+                };
+
+                const jsonString = JSON.stringify(directProgressData, null, 2);
+                const blob = new Blob([jsonString], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'image_categorizer_progress.json';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                statusText.textContent = 'Progress saved to image_categorizer_progress.json.';
+            });
+        }
+
+        if (loadProgressButton) {
+            loadProgressButton.addEventListener('click', () => progressFileInput.click());
+        }
+        if (progressFileInput) {
+            progressFileInput.addEventListener('change', handleProgressFileLoad);
+        }
+
+        // Helper functions for progress saving/loading
+        function getFileMetadata(file) {
+            if (!file || typeof file.name === 'undefined') return null; // Handle cases where file might be null (e.g. if master 'files' array had placeholders)
+            return {
+                name: file.name,
+                size: file.size,
+                type: file.type,
+                lastModified: file.lastModified
+            };
+        }
+
+        function filesArrayToMetadata(filesArray) {
+            return filesArray.map(getFileMetadata).filter(meta => meta !== null); // Filter out nulls if any
+        }
+
+        function categoriesToMetadata(categoriesObj) {
+            const metadataCategories = {};
+            for (const categoryName in categoriesObj) {
+                metadataCategories[categoryName] = filesArrayToMetadata(categoriesObj[categoryName]);
+            }
+            return metadataCategories;
+        }
+
+
+        function handleFileSelection(event) {
+            const selectedLiveFiles = Array.from(event.target.files).filter(file => file.type.startsWith('image/'));
+            if (selectedLiveFiles.length === 0) {
+                statusText.textContent = 'No image files selected.';
+                event.target.value = null; // Reset file input
+                return;
+            }
+
+            if (isRestoringProgress && pendingProgressData) {
+                files = []; // Clear existing files before restoring
+                restoreProgress(selectedLiveFiles, pendingProgressData);
+                pendingProgressData = null; // Clear after use
+                isRestoringProgress = false; // Mark restoration as complete or attempted
+            } else {
+                // Normal file selection: concat and ensure uniqueness
+                const currentFileMap = new Map(files.map(f => [f.name + f.size + f.lastModified, f]));
+                selectedLiveFiles.forEach(sf => {
+                    const key = sf.name + sf.size + sf.lastModified;
+                    if (!currentFileMap.has(key)) {
+                        currentFileMap.set(key, sf);
+                    }
+                });
+                files = Array.from(currentFileMap.values());
+                statusText.textContent = `${files.length} image(s) loaded.`;
+
+                if (Object.keys(categories).length > 0 && files.length > 0) {
+                    if (imageSection.style.display !== 'block' && actionsSection.style.display !== 'block') {
+                        startCategorization();
+                    }
+                } else if (files.length > 0) {
+                    statusText.textContent += ' Please create categories or load saved categories/progress.';
+                }
+            }
+            event.target.value = null; // Reset file input
+        }
+
+
+        function handleProgressFileLoad(event) {
+            const file = event.target.files[0];
+            if (!file) {
+                statusText.textContent = 'No progress file selected.';
+                return;
+            }
+            if (file.type !== "application/json") {
+                statusText.textContent = 'Invalid file type. Please select a .json progress file.';
+                event.target.value = null;
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const loadedData = JSON.parse(e.target.result);
+                    if (!loadedData.allFileMetadata || !loadedData.categoryAssignments ||
+                        typeof loadedData.currentFileIndex === 'undefined' || !loadedData.categoryDefinitions) {
+                        throw new Error('Invalid progress file format.');
+                    }
+                    pendingProgressData = loadedData;
+                    isRestoringProgress = true;
+                    files = []; // Clear current files, will be rebuilt from selection
+                    categories = {}; // Clear current categories
+                    skippedFiles = []; // Clear skipped files
+                    currentFileIndex = 0;
+                    lastAction = null; // Reset last action on loading progress
+                    if(undoButton) undoButton.disabled = true; // Disable undo button
+                    renderCategoryList(); // Clear visual list initially
+                    statusText.textContent = `Progress file "${file.name}" loaded. IMPORTANT: Now please re-select ALL the image files or the folder you were working with to match the saved progress.`;
+                } catch (error) {
+                    console.error('Error parsing progress file:', error);
+                    statusText.textContent = `Error loading progress from ${file.name}: ${error.message}`;
+                    pendingProgressData = null;
+                    isRestoringProgress = false;
+                } finally {
+                    event.target.value = null;
+                }
+            };
+            reader.onerror = function() {
+                statusText.textContent = `Error reading progress file ${file.name}.`;
+                pendingProgressData = null;
+                isRestoringProgress = false;
+                event.target.value = null;
+            };
+            reader.readAsText(file);
+        }
+
+
+        function restoreProgress(newlySelectedLiveFiles, loadedProgressData) {
+            statusText.textContent = "Restoring progress...";
+            const liveFileMap = new Map();
+            newlySelectedLiveFiles.forEach(f => {
+                liveFileMap.set(`${f.name}-${f.size}-${f.lastModified}`, f);
+            });
+
+            let masterFilesTemp = []; // Use temp array to build the new 'files' in order
+            let foundCount = 0;
+            loadedProgressData.allFileMetadata.forEach(meta => {
+                if (!meta) { // Should not happen if saved correctly
+                    masterFilesTemp.push(null); // Maintain index with a placeholder
+                    return;
+                }
+                const key = `${meta.name}-${meta.size}-${meta.lastModified}`;
+                if (liveFileMap.has(key)) {
+                    masterFilesTemp.push(liveFileMap.get(key));
+                    foundCount++;
+                } else {
+                    masterFilesTemp.push(null); // Placeholder for missing file
+                    console.warn(`File from progress master list not found in re-selection: ${meta.name}`);
+                }
+            });
+            files = masterFilesTemp; // Assign the ordered list (with potential nulls)
+
+            if (foundCount === 0 && loadedProgressData.allFileMetadata.length > 0) {
+                 statusText.textContent = "No files from the saved progress could be matched with your re-selection. Please ensure you selected the correct files/folder. Resetting.";
+                 resetButton.click(); // Trigger a full reset
+                 return;
+            }
+
+
+            categories = {}; // Reset categories object
+            loadedProgressData.categoryDefinitions.forEach(catName => {
+                categories[catName] = []; // Initialize with empty arrays
+            });
+
+            for (const categoryName in loadedProgressData.categoryAssignments) {
+                if (!categories[categoryName]) categories[categoryName] = []; // Ensure category exists
+                loadedProgressData.categoryAssignments[categoryName].forEach(meta => {
+                     if (!meta) return;
+                    const key = `${meta.name}-${meta.size}-${meta.lastModified}`;
+                    if (liveFileMap.has(key)) {
+                        categories[categoryName].push(liveFileMap.get(key));
+                    } else {
+                        console.warn(`Categorized file ${meta.name} for ${categoryName} not found.`);
+                    }
+                });
+            }
+            renderCategoryList();
+
+            skippedFiles = [];
+            loadedProgressData.skippedFileMetadata.forEach(meta => {
+                if (!meta) return;
+                const key = `${meta.name}-${meta.size}-${meta.lastModified}`;
+                if (liveFileMap.has(key)) {
+                    skippedFiles.push(liveFileMap.get(key));
+                } else {
+                    console.warn(`Skipped file ${meta.name} not found.`);
+                }
+            });
+
+            currentFileIndex = loadedProgressData.currentFileIndex;
+            lastAction = null; // Reset last action on restoring progress
+            if(undoButton) undoButton.disabled = true;
+            
+            let actualFilesCount = files.filter(f => f !== null).length;
+            if (actualFilesCount === 0 && loadedProgressData.allFileMetadata.length > 0) {
+                 statusText.textContent = "Warning: None of the original files were found in your re-selection. Cannot proceed with restored progress.";
+                 // Potentially don't start categorization, or offer a reset.
+                 // For now, it might try to start and hit issues with displayCurrentImage.
+                 // Let's ensure it goes to finish if index is beyond the "valid" files.
+                 if (currentFileIndex >= files.length) finishCategorization();
+                 else displayCurrentImage(); // It will then handle nulls
+                 return;
+            }
+
+
+            if (files.length > 0 && Object.keys(categories).length > 0) {
+                imageSection.style.display = 'block';
+                document.querySelector('.controls').style.display = 'none';
+                document.querySelector('.category-section h2').textContent = 'Categories (Click to assign)';
+                categoryNameInput.style.display = 'none';
+                addCategoryButton.style.display = 'none';
+                if(saveCategoriesButton) saveCategoriesButton.style.display = 'none';
+                if(loadCategoriesButton) loadCategoriesButton.style.display = 'none';
+                if(loadProgressButton) loadProgressButton.style.display = 'none';
+                if(saveProgressButton) saveProgressButton.style.display = 'block';
+
+                addCategorizationKeyListener();
+                renderCategoryButtonsForAssignment();
+                displayCurrentImage(); // This will show the image at currentFileIndex
+                statusText.textContent = `Progress restored. ${loadedProgressData.allFileMetadata.length - files.filter(f=>f===null).length} of ${loadedProgressData.allFileMetadata.length} files matched. Resuming.`;
+            } else if (currentFileIndex >= files.length && files.length > 0) { // All processed
+                statusText.textContent = "Progress restored. All files were already processed.";
+                finishCategorization();
+            } else {
+                 statusText.textContent = "Could not fully restore progress or no files to process. Please check selected files or reset.";
+                 // UI might be in an intermediate state, guide user to reset or re-select.
+            }
+        }
+
+
+        addCategoryButton.addEventListener('click', () => {
+            const categoryName = categoryNameInput.value.trim();
+            if (categoryName && !categories[categoryName]) {
+                categories[categoryName] = [];
+                renderCategoryList();
+                categoryNameInput.value = '';
+                statusText.textContent = `Category "${categoryName}" added.`;
+                if (files.length > 0 && Object.keys(categories).length > 0 &&
+                    imageSection.style.display !== 'block' && actionsSection.style.display !== 'block') {
+                    startCategorization();
+                }
+            } else if (categories[categoryName]) {
+                statusText.textContent = `Category "${categoryName}" already exists.`;
+            } else {
+                statusText.textContent = 'Please enter a valid category name.';
+            }
+        });
+
+        function renderCategoryList() {
+            categoryList.innerHTML = '';
+            Object.keys(categories).forEach(categoryName => {
+                const li = document.createElement('li');
+                li.textContent = categoryName;
+                categoryList.appendChild(li);
+            });
+        }
+
+        function saveCategories() {
+            const categoryNames = Object.keys(categories);
+            if (categoryNames.length > 0) {
+                const jsonString = JSON.stringify(categoryNames, null, 2);
+                const blob = new Blob([jsonString], { type: 'application/json' });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'image_categories.json';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+                statusText.textContent = 'Categories saved to image_categories.json.';
+            } else {
+                statusText.textContent = 'No categories to save.';
+            }
+        }
+
+        function handleCategoryFileLoad(event) {
+            const file = event.target.files[0];
+            if (!file) {
+                statusText.textContent = 'No file selected for loading categories.';
+                return;
+            }
+            if (file.type !== "application/json") {
+                statusText.textContent = 'Invalid file type. Please select a .json file.';
+                event.target.value = null;
+                return;
+            }
+            const reader = new FileReader();
+            reader.onload = function(e) {
+                try {
+                    const loadedNames = JSON.parse(e.target.result);
+                    if (Array.isArray(loadedNames) && loadedNames.every(name => typeof name === 'string')) {
+                        const oldCategories = categories; // Preserve assignments if possible
+                        categories = {};
+                        loadedNames.forEach(name => {
+                            const trimmedName = name.trim();
+                            if (trimmedName !== '') {
+                                categories[trimmedName] = (oldCategories[trimmedName] && Array.isArray(oldCategories[trimmedName])) ? oldCategories[trimmedName] : [];
+                            }
+                        });
+                        renderCategoryList();
+                        statusText.textContent = `Categories loaded from ${file.name}.`;
+                        if (files.length > 0 && Object.keys(categories).length > 0 &&
+                            imageSection.style.display !== 'block' && actionsSection.style.display !== 'block') {
+                            startCategorization();
+                        } else if (imageSection.style.display === 'block') {
+                            renderCategoryButtonsForAssignment(); // Update buttons if already categorizing
+                        }
+                    } else {
+                        throw new Error('Invalid JSON format: Expected an array of strings.');
+                    }
+                } catch (error) {
+                    console.error('Error parsing categories from JSON file:', error);
+                    statusText.textContent = `Error loading categories from ${file.name}: ${error.message}`;
+                } finally {
+                    event.target.value = null;
+                }
+            };
+            reader.onerror = function() {
+                statusText.textContent = `Error reading file ${file.name}.`;
+                event.target.value = null;
+            };
+            reader.readAsText(file);
+        }
+
+        function startCategorization() {
+            if (files.filter(f => f !== null).length === 0) { // Check for actual files
+                statusText.textContent = 'Please select images first.';
+                return;
+            }
+            if (Object.keys(categories).length === 0) {
+                statusText.textContent = 'Please create at least one category or load from file.';
+                return;
+            }
+            // Find the first non-null file to start with if currentFileIndex is on a null one.
+            while(currentFileIndex < files.length && files[currentFileIndex] === null) {
+                currentFileIndex++;
+            }
+            if (currentFileIndex >= files.length) { // All remaining files were null
+                finishCategorization();
+                return;
+            }
+
+            imageSection.style.display = 'block';
+            document.querySelector('.controls').style.display = 'none';
+            document.querySelector('.category-section h2').textContent = 'Categories (Click to assign)';
+            categoryNameInput.style.display = 'none';
+            addCategoryButton.style.display = 'none';
+            if(saveCategoriesButton) saveCategoriesButton.style.display = 'none';
+            if(loadCategoriesButton) loadCategoriesButton.style.display = 'none';
+            if(loadProgressButton) loadProgressButton.style.display = 'none';
+            if(saveProgressButton) saveProgressButton.style.display = 'block';
+
+            addCategorizationKeyListener();
+            renderCategoryButtonsForAssignment();
+            displayCurrentImage();
+        }
+        
+        function renderCategoryButtonsForAssignment() {
+            categoryButtonsContainer.innerHTML = '';
+            const categoryNames = Object.keys(categories);
+            categoryNames.forEach((categoryName, index) => {
+                const button = document.createElement('button');
+                if (index < 9) {
+                    button.textContent = `${index + 1}. ${categoryName}`;
+                } else {
+                    button.textContent = categoryName;
+                }
+                button.dataset.category = categoryName;
+                button.addEventListener('click', assignToCategory);
+                categoryButtonsContainer.appendChild(button);
+            });
+        }
+
+        function displayCurrentImage() {
+            // Ensure we skip over any null placeholders in the files array
+            while(currentFileIndex < files.length && files[currentFileIndex] === null) {
+                console.log(`Skipping null file at index ${currentFileIndex} during display.`);
+                currentFileIndex++;
+            }
+
+            if (currentFileIndex < files.length) {
+                const file = files[currentFileIndex]; // This should now be a valid File object or we've passed all files
+                imagePreview.src = URL.createObjectURL(file);
+                imagePreview.onload = () => URL.revokeObjectURL(imagePreview.src); // Clean up object URL
+                imagePreview.onerror = () => { // Handle if somehow a bad file object slips through
+                    statusText.textContent = `Error loading image ${file.name}. Skipping.`;
+                    performSkipAction(true); // true to indicate an error skip
+                };
+                progressText.textContent = `Image ${currentFileIndex + 1} of ${files.length} (${file.name})`;
+                actionsSection.style.display = 'none';
+            } else {
+                finishCategorization();
+            }
+        }
+
+        // Modified to accept category name directly
+        function assignImageToCategoryByName(categoryName) {
+            if (currentFileIndex >= files.length || !files[currentFileIndex]) { // Check for valid file
+                statusText.textContent = "No valid image to assign or end of list.";
+                if (currentFileIndex >= files.length) finishCategorization();
+                return; 
+            }
+
+            const currentImageFile = files[currentFileIndex];
+            if (categories[categoryName]) { 
+                if (!Array.isArray(categories[categoryName])) { 
+                    categories[categoryName] = [];
+                }
+                // Record action before modifying data and index
+                lastAction = { 
+                    fileIndex: currentFileIndex, 
+                    fileObject: currentImageFile, 
+                    type: 'assign', 
+                    categoryName: categoryName 
+                };
+                categories[categoryName].push(currentImageFile);
+                statusText.textContent = `Image "${currentImageFile.name}" assigned to "${categoryName}".`;
+                if(undoButton) undoButton.disabled = false;
+            } else {
+                statusText.textContent = `Error: Category "${categoryName}" not found.`;
+                return; 
+            }
+            nextImage();
+        }
+
+        function assignToCategory(event) {
+            const categoryName = event.target.dataset.category;
+            assignImageToCategoryByName(categoryName);
+        }
+
+        function performSkipAction(isErrorSkip = false) {
+            if (currentFileIndex < files.length && files[currentFileIndex] !== null) {
+                if (!isErrorSkip) { // Don't add to skipped if it was an error loading the image itself
+                    skippedFiles.push(files[currentFileIndex]);
+                    statusText.textContent = `Image "${files[currentFileIndex].name}" skipped.`;
+                }
+            } else if (currentFileIndex < files.length && files[currentFileIndex] === null && !isErrorSkip) {
+                statusText.textContent = `Skipping placeholder for a missing file.`;
+            }
+            nextImage();
+        }
+
+
+        skipButton.addEventListener('click', () => {
+            performSkipAction();
+        });
+
+        if (undoButton) { // New: Event listener for the undo button
+            undoButton.addEventListener('click', undoLastAction);
+        }
+
+        function undoLastAction() {
+            if (!lastAction) {
+                statusText.textContent = "No action to undo.";
+                return;
+            }
+
+            const actionToUndo = lastAction;
+            lastAction = null; // Consume the undo action
+            if(undoButton) undoButton.disabled = true;
+
+            currentFileIndex = actionToUndo.fileIndex; // Go back to the image that was acted upon
+
+            if (actionToUndo.type === 'assign') {
+                const categoryArray = categories[actionToUndo.categoryName];
+                if (categoryArray) {
+                    const indexInCateg = categoryArray.indexOf(actionToUndo.fileObject);
+                    if (indexInCateg > -1) {
+                        categoryArray.splice(indexInCateg, 1);
+                    }
+                }
+                statusText.textContent = `Assignment of "${actionToUndo.fileObject.name}" to "${actionToUndo.categoryName}" undone.`;
+            } else if (actionToUndo.type === 'skip') {
+                const indexInSkipped = skippedFiles.indexOf(actionToUndo.fileObject);
+                if (indexInSkipped > -1) {
+                    skippedFiles.splice(indexInSkipped, 1);
+                }
+                statusText.textContent = `Skip of "${actionToUndo.fileObject.name}" undone.`;
+            }
+            
+            displayCurrentImage(); // Re-display the image
+        }
+
+
+        function nextImage() {
+            currentFileIndex++;
+            displayCurrentImage();
+        }
+
+        function finishCategorization() {
+            removeCategorizationKeyListener(); // Remove key listener when categorization ends
+            if(undoButton) undoButton.disabled = true; // Disable undo button
+            imageSection.style.display = 'none';
+            actionsSection.style.display = 'block';
+            statusText.textContent = 'All images processed! Ready to download.';
+            if(saveProgressButton) saveProgressButton.style.display = 'none'; // Hide when finished
+            prepareDownloads();
+        }
+
+        function prepareDownloads() {
+            downloadSection.innerHTML = '';
+            let hasContentToDownload = false;
+            for (const categoryName in categories) {
+                if (categories[categoryName] && categories[categoryName].length > 0) {
+                    hasContentToDownload = true;
+                    const button = document.createElement('button');
+                    button.textContent = `Download ${categoryName} (${categories[categoryName].length} images).zip`;
+                    button.addEventListener('click', () => downloadFilesAsZip(categories[categoryName], `${categoryName}_images`));
+                    downloadSection.appendChild(button);
+                }
+            }
+            if (skippedFiles.length > 0) {
+                hasContentToDownload = true;
+                const button = document.createElement('button');
+                button.textContent = `Download Skipped Images (${skippedFiles.length} images).zip`;
+                button.addEventListener('click', () => downloadFilesAsZip(skippedFiles, "Skipped_Images"));
+                downloadSection.appendChild(button);
+            }
+            if (!hasContentToDownload) {
+                downloadSection.innerHTML = '<p>No images were categorized or skipped. Nothing to download.</p>';
+            }
+        }
+
+        async function downloadFilesAsZip(filesToZip, zipFileNameBase) {
+            const validFilesToZip = filesToZip.filter(f => f !== null); // Ensure no nulls
+            if (validFilesToZip.length === 0) {
+                statusText.textContent = `No valid files to zip for ${zipFileNameBase}.`;
+                return;
+            }
+            const zip = new JSZip();
+            statusText.textContent = `Zipping ${zipFileNameBase}...`;
+            validFilesToZip.forEach(file => zip.file(file.name, file));
+            try {
+                const content = await zip.generateAsync({ type: "blob" }, (metadata) => {
+                     statusText.textContent = `Zipping ${zipFileNameBase}: ${metadata.percent.toFixed(2)}%`;
+                });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(content);
+                link.download = `${zipFileNameBase}.zip`;
+                document.body.appendChild(link);
+                link.click();
+                document.body.removeChild(link);
+                URL.revokeObjectURL(link.href);
+                statusText.textContent = `Downloaded ${zipFileNameBase}.zip`;
+            } catch (error) {
+                console.error(`Error zipping ${zipFileNameBase}:`, error);
+                statusText.textContent = `Error creating ZIP for ${zipFileNameBase}: ${error.message}`;
+            }
+        }
+
+        resetButton.addEventListener('click', () => {
+            removeCategorizationKeyListener(); // Remove key listener on reset
+            files = [];
+            currentFileIndex = 0;
+            skippedFiles = []; 
+            categories = {}; 
+            lastAction = null; // Reset last action
+            if(undoButton) undoButton.disabled = true; // Disable undo button
+            
+            imageFilesInput.value = ''; 
+            imageFolderInput.value = ''; 
+            
+            imageSection.style.display = 'none';
+            actionsSection.style.display = 'none';
+            document.querySelector('.controls').style.display = 'block'; 
+            document.querySelector('.category-section h2').textContent = '1. Create Categories / Manage Session';
+            categoryNameInput.style.display = 'inline-block'; 
+            addCategoryButton.style.display = 'inline-block'; 
+            if(saveCategoriesButton) saveCategoriesButton.style.display = 'inline-block';
+            if(loadCategoriesButton) loadCategoriesButton.style.display = 'inline-block';
+            if(loadProgressButton) loadProgressButton.style.display = 'inline-block';
+            if(saveProgressButton) saveProgressButton.style.display = 'none';
+
+
+            renderCategoryList(); // Clear category list display
+            downloadSection.innerHTML = '';
+            statusText.textContent = 'App reset. Select new images or manage categories/progress.';
+        });
+
+        function handleCategorizationKeyPress(event) {
+            if (imageSection.style.display !== 'block' || event.target.tagName === 'INPUT' || event.target.tagName === 'TEXTAREA') {
+                return;
+            }
+            const key = event.key;
+            if (key >= '1' && key <= '9') {
+                event.preventDefault();
+                const categoryIndex = parseInt(key, 10) - 1;
+                const categoryNames = Object.keys(categories);
+                if (categoryIndex >= 0 && categoryIndex < categoryNames.length) {
+                    assignImageToCategoryByName(categoryNames[categoryIndex]);
+                } else {
+                    statusText.textContent = `No category mapped to key ${key}.`;
+                }
+            } else if (key === '0') {
+                event.preventDefault();
+                performSkipAction();
+            } else if (event.key === 'Backspace') { // New: Backspace for undo
+                event.preventDefault();
+                if (undoButton && !undoButton.disabled) {
+                    undoLastAction();
+                }
+            }
+        }
+        
+        // Initial button states
+        if(saveProgressButton) saveProgressButton.style.display = 'none';
+        if(loadProgressButton) loadProgressButton.style.display = 'inline-block';
+
+    </script>
+</body>
+</html>
